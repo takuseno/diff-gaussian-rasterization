@@ -255,6 +255,85 @@ __global__ void preprocessCUDA(int P, int D, int M,
 	tiles_touched[idx] = (rect_max.y - rect_min.y) * (rect_max.x - rect_min.x);
 }
 
+// Perform initial steps for each Gaussian prior to rasterization.
+template<int C>
+__global__ void filter_preprocessCUDA(int P, int M,
+	const float* orig_points,
+	const glm::vec3* scales,
+	const float scale_modifier,
+	const glm::vec4* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const int W, int H,
+	const float tan_fovx, float tan_fovy,
+	const float focal_x, float focal_y,
+	int* radii,
+	float* points_xy_image,
+	float* cov3Ds,
+	const dim3 grid,
+	bool prefiltered)
+{
+	auto idx = cg::this_grid().thread_rank();
+	if (idx >= P)
+		return;
+
+	// Initialize radius and touched tiles to 0. If this isn't changed,
+	// this Gaussian will not be processed further.
+	radii[idx] = 0;
+
+	// Perform near culling, quit if outside.
+	float3 p_view;
+	if (!in_frustum(idx, orig_points, viewmatrix, projmatrix, prefiltered, p_view))
+		return;
+
+	// Transform point by projecting
+	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
+	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
+	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
+
+	// If 3D covariance matrix is precomputed, use it, otherwise compute
+	// from scaling and rotation parameters. 
+	const float* cov3D;
+	if (cov3D_precomp != nullptr)
+	{
+		cov3D = cov3D_precomp + idx * 6;
+	}
+	else
+	{
+		computeCov3D(scales[idx], scale_modifier, rotations[idx], cov3Ds + idx * 6);
+		cov3D = cov3Ds + idx * 6;
+	}
+
+	// Compute 2D screen-space covariance matrix
+	float3 cov = computeCov2D(p_orig, focal_x, focal_y, tan_fovx, tan_fovy, cov3D, viewmatrix);
+
+	// Invert covariance (EWA algorithm)
+	float det = (cov.x * cov.z - cov.y * cov.y);
+	if (det == 0.0f)
+		return;
+
+	// Compute extent in screen space (by finding eigenvalues of
+	// 2D covariance matrix). Use extent to compute a bounding rectangle
+	// of screen-space tiles that this Gaussian overlaps with. Quit if
+	// rectangle covers 0 tiles. 
+	float mid = 0.5f * (cov.x + cov.z);
+	float lambda1 = mid + sqrt(max(0.1f, mid * mid - det));
+	float lambda2 = mid - sqrt(max(0.1f, mid * mid - det));
+	float my_radius = ceil(3.f * sqrt(max(lambda1, lambda2)));
+	float2 point_image = { ndc2Pix(p_proj.x, W), ndc2Pix(p_proj.y, H) };
+	uint2 rect_min, rect_max;
+	getRect(point_image, my_radius, rect_min, rect_max, grid);
+	if ((rect_max.x - rect_min.x) * (rect_max.y - rect_min.y) == 0)
+		return;
+
+	radii[idx] = my_radius;
+	points_xy_image[2 * idx] = point_image.x; // width
+	points_xy_image[2 * idx + 1] = point_image.y; // height 
+}
+
+
 // Main rasterization method. Collaboratively works on one tile per
 // block, each thread treats one pixel. Alternates between fetching 
 // and rasterizing data.
@@ -263,14 +342,18 @@ __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
 	const uint2* __restrict__ ranges,
 	const uint32_t* __restrict__ point_list,
-	int W, int H,
+	int W, int H, int S,
 	const float2* __restrict__ points_xy_image,
 	const float* __restrict__ features,
+	const float* __restrict__ depths,
+	const float* __restrict__ semantics,
 	const float4* __restrict__ conic_opacity,
-	float* __restrict__ final_T,
+	float* __restrict__ out_alpha,
 	uint32_t* __restrict__ n_contrib,
 	const float* __restrict__ bg_color,
-	float* __restrict__ out_color)
+	float* __restrict__ out_color,
+	float* __restrict__ out_depth,
+	float* __restrict__ out_semantic)
 {
 	// Identify current tile and associated min/max pixel range.
 	auto block = cg::this_thread_block();
@@ -282,7 +365,7 @@ renderCUDA(
 	float2 pixf = { (float)pix.x, (float)pix.y };
 
 	// Check if this thread is associated with a valid pixel or outside.
-	bool inside = pix.x < W&& pix.y < H;
+	bool inside = pix.x < W && pix.y < H;
 	// Done threads can help with fetching, but don't rasterize
 	bool done = !inside;
 
@@ -301,6 +384,8 @@ renderCUDA(
 	uint32_t contributor = 0;
 	uint32_t last_contributor = 0;
 	float C[CHANNELS] = { 0 };
+	float weight = 0;
+	float D = 0;
 
 	// Iterate over batches until all done or range is complete
 	for (int i = 0; i < rounds; i++, toDo -= BLOCK_SIZE)
@@ -354,6 +439,13 @@ renderCUDA(
 			for (int ch = 0; ch < CHANNELS; ch++)
 				C[ch] += features[collected_id[j] * CHANNELS + ch] * alpha * T;
 
+			for (int ch = 0; ch < S; ch++){
+				out_semantic[ch * H * W + pix_id] += semantics[collected_id[j] * S + ch] * alpha * T;
+			}
+
+			weight += alpha * T;
+			D += depths[collected_id[j]] * alpha * T;
+
 			T = test_T;
 
 			// Keep track of last range entry to update this
@@ -366,10 +458,11 @@ renderCUDA(
 	// rendering data to the frame and auxiliary buffers.
 	if (inside)
 	{
-		final_T[pix_id] = T;
 		n_contrib[pix_id] = last_contributor;
 		for (int ch = 0; ch < CHANNELS; ch++)
 			out_color[ch * H * W + pix_id] = C[ch] + T * bg_color[ch];
+		out_alpha[pix_id] = weight; //1 - T;
+		out_depth[pix_id] = D;
 	}
 }
 
@@ -377,26 +470,34 @@ void FORWARD::render(
 	const dim3 grid, dim3 block,
 	const uint2* ranges,
 	const uint32_t* point_list,
-	int W, int H,
+	int W, int H, int S,
 	const float2* means2D,
 	const float* colors,
+	const float* depths,
+	const float* semantics,
 	const float4* conic_opacity,
-	float* final_T,
+	float* out_alpha,
 	uint32_t* n_contrib,
 	const float* bg_color,
-	float* out_color)
+	float* out_color,
+	float* out_depth,
+	float* out_semantic)
 {
 	renderCUDA<NUM_CHANNELS> << <grid, block >> > (
 		ranges,
 		point_list,
-		W, H,
+		W, H, S,
 		means2D,
 		colors,
+		depths,
+		semantics,
 		conic_opacity,
-		final_T,
+		out_alpha,
 		n_contrib,
 		bg_color,
-		out_color);
+		out_color,
+		out_depth,
+		out_semantic);
 }
 
 void FORWARD::preprocess(int P, int D, int M,
@@ -450,6 +551,45 @@ void FORWARD::preprocess(int P, int D, int M,
 		conic_opacity,
 		grid,
 		tiles_touched,
+		prefiltered
+		);
+}
+
+
+void FORWARD::filter_preprocess(int P, int M,
+	const float* means3D,
+	const glm::vec3* scales,
+	const float scale_modifier,
+	const glm::vec4* rotations,
+	const float* cov3D_precomp,
+	const float* viewmatrix,
+	const float* projmatrix,
+	const int W, int H,
+	const float focal_x, float focal_y,
+	const float tan_fovx, float tan_fovy,
+	int* radii,
+	float* means2D,
+	float* cov3Ds,
+	const dim3 grid,
+	bool prefiltered)
+{
+
+	filter_preprocessCUDA<NUM_CHANNELS> << <(P + 255) / 256, 256 >> > (
+		P, M,
+		means3D,
+		scales,
+		scale_modifier,
+		rotations,
+		cov3D_precomp,
+		viewmatrix, 
+		projmatrix,
+		W, H,
+		tan_fovx, tan_fovy,
+		focal_x, focal_y,
+		radii,
+		means2D,
+		cov3Ds,
+		grid,
 		prefiltered
 		);
 }

@@ -13,6 +13,7 @@
 #define CUDA_RASTERIZER_CONFIG_H_INCLUDED
 
 #define NUM_CHANNELS 3 // Default 3, RGB
+#define NUM_CLASSES 20 // Should change when classes number is larger !!! 
 #define BLOCK_X 16
 #define BLOCK_Y 16
 
